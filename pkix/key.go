@@ -20,23 +20,53 @@ package pkix
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
 	"errors"
-	"math/big"
+	"fmt"
 )
 
 const (
-	rsaPrivateKeyPEMBlockType = "RSA PRIVATE KEY"
+	rsaPrivateKeyPEMBlockType   = "RSA PRIVATE KEY"
+	ecdsaPrivateKeyPEMBlockType = "EC PRIVATE KEY"
 )
 
 // CreateRSAKey creates a new Key using RSA algorithm
 func CreateRSAKey(rsaBits int) (*Key, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, rsaBits)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewKey(&priv.PublicKey, priv), nil
+}
+
+// CreateECDSAKey creates a new Key using RSA algorithm
+func CreateECDSAKey(curvName string) (*Key, error) {
+	var (
+		priv *ecdsa.PrivateKey
+		err  error
+	)
+
+	switch curvName {
+	case "P224":
+		priv, err = ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
+	case "P256":
+		priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	case "P384":
+		priv, err = ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	case "P521":
+		priv, err = ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	default:
+		err = fmt.Errorf("Unrecognized elliptic curve: %q", curvName)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -61,16 +91,23 @@ func NewKeyFromPrivateKeyPEM(data []byte) (*Key, error) {
 	if pemBlock == nil {
 		return nil, errors.New("cannot find the next PEM formatted block")
 	}
-	if pemBlock.Type != rsaPrivateKeyPEMBlockType || len(pemBlock.Headers) != 0 {
-		return nil, errors.New("unmatched type or headers")
-	}
 
-	priv, err := x509.ParsePKCS1PrivateKey(pemBlock.Bytes)
-	if err != nil {
-		return nil, err
+	switch pemBlock.Type {
+	case rsaPrivateKeyPEMBlockType:
+		priv, err := x509.ParsePKCS1PrivateKey(pemBlock.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		return NewKey(&priv.PublicKey, priv), nil
+	case ecdsaPrivateKeyPEMBlockType:
+		priv, err := x509.ParseECPrivateKey(pemBlock.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		return NewKey(&priv.PublicKey, priv), nil
+	default:
+		return nil, fmt.Errorf("unmatched type or headers: %s", pemBlock.Type)
 	}
-
-	return NewKey(&priv.PublicKey, priv), nil
 }
 
 // NewKeyFromEncryptedPrivateKeyPEM inits Key from encrypted PEM-format rsa private key bytes
@@ -79,8 +116,8 @@ func NewKeyFromEncryptedPrivateKeyPEM(data []byte, password []byte) (*Key, error
 	if pemBlock == nil {
 		return nil, errors.New("cannot find the next PEM formatted block")
 	}
-	if pemBlock.Type != rsaPrivateKeyPEMBlockType {
-		return nil, errors.New("unmatched type or headers")
+	if pemBlock.Type != rsaPrivateKeyPEMBlockType && pemBlock.Type != ecdsaPrivateKeyPEMBlockType {
+		return nil, fmt.Errorf("unmatched type or headers: %s", pemBlock.Type)
 	}
 
 	b, err := x509.DecryptPEMBlock(pemBlock, password)
@@ -88,11 +125,19 @@ func NewKeyFromEncryptedPrivateKeyPEM(data []byte, password []byte) (*Key, error
 		return nil, err
 	}
 
-	priv, err := x509.ParsePKCS1PrivateKey(b)
+	if pemBlock.Type == rsaPrivateKeyPEMBlockType {
+		priv, err := x509.ParsePKCS1PrivateKey(b)
+		if err != nil {
+			return nil, err
+		}
+
+		return NewKey(&priv.PublicKey, priv), nil
+	}
+
+	priv, err := x509.ParseECPrivateKey(pemBlock.Bytes)
 	if err != nil {
 		return nil, err
 	}
-
 	return NewKey(&priv.PublicKey, priv), nil
 }
 
@@ -106,8 +151,17 @@ func (k *Key) ExportPrivate() ([]byte, error) {
 			Type:  rsaPrivateKeyPEMBlockType,
 			Bytes: privBytes,
 		}
+	case *ecdsa.PrivateKey:
+		privBytes, err := x509.MarshalECPrivateKey(priv)
+		if err != nil {
+			return nil, err
+		}
+		privPEMBlock = &pem.Block{
+			Type:  ecdsaPrivateKeyPEMBlockType,
+			Bytes: privBytes,
+		}
 	default:
-		return nil, errors.New("only RSA private key is supported")
+		return nil, errors.New("only RSA and ECDRSA private key are supported")
 	}
 
 	buf := new(bytes.Buffer)
@@ -119,15 +173,25 @@ func (k *Key) ExportPrivate() ([]byte, error) {
 
 // ExportEncryptedPrivate exports encrypted PEM-format private key
 func (k *Key) ExportEncryptedPrivate(password []byte) ([]byte, error) {
-	var privBytes []byte
+	var (
+		privBytes []byte
+		err       error
+		pemType   string
+	)
 	switch priv := k.Private.(type) {
 	case *rsa.PrivateKey:
-		privBytes = x509.MarshalPKCS1PrivateKey(priv)
+		privBytes, pemType = x509.MarshalPKCS1PrivateKey(priv), rsaPrivateKeyPEMBlockType
+	case *ecdsa.PrivateKey:
+		privBytes, err = x509.MarshalECPrivateKey(priv)
+		if err != nil {
+			return nil, err
+		}
+		pemType = ecdsaPrivateKeyPEMBlockType
 	default:
 		return nil, errors.New("only RSA private key is supported")
 	}
 
-	privPEMBlock, err := x509.EncryptPEMBlock(rand.Reader, rsaPrivateKeyPEMBlockType, privBytes, password, x509.PEMCipher3DES)
+	privPEMBlock, err := x509.EncryptPEMBlock(rand.Reader, pemType, privBytes, password, x509.PEMCipher3DES)
 	if err != nil {
 		return nil, err
 	}
@@ -139,31 +203,25 @@ func (k *Key) ExportEncryptedPrivate(password []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// rsaPublicKey reflects the ASN.1 structure of a PKCS#1 public key.
-type rsaPublicKey struct {
-	N *big.Int
-	E int
+type subjectPublicKeyInfo struct {
+	Algorithm        pkix.AlgorithmIdentifier
+	SubjectPublicKey asn1.BitString
 }
 
 // GenerateSubjectKeyID generates SubjectKeyId used in Certificate
 // Id is 160-bit SHA-1 hash of the value of the BIT STRING subjectPublicKey
 func GenerateSubjectKeyID(pub crypto.PublicKey) ([]byte, error) {
-	var pubBytes []byte
-	var err error
-	switch pub := pub.(type) {
-	case *rsa.PublicKey:
-		pubBytes, err = asn1.Marshal(rsaPublicKey{
-			N: pub.N,
-			E: pub.E,
-		})
-		if err != nil {
-			return nil, err
-		}
-	default:
-		return nil, errors.New("only RSA public key is supported")
+	encodedpub, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+	var subPKI subjectPublicKeyInfo
+	_, err = asn1.Unmarshal(encodedpub, &subPKI)
+	if err != nil {
+		return nil, err
 	}
 
-	hash := sha1.Sum(pubBytes)
-
-	return hash[:], nil
+	pubhash := sha1.New()
+	pubhash.Write(subPKI.SubjectPublicKey.Bytes)
+	return pubhash.Sum(nil), nil
 }

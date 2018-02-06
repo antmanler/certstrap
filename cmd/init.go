@@ -47,6 +47,8 @@ func NewInitCommand() cli.Command {
 			cli.StringFlag{"locality, l", "", "CA locality", ""},
 			cli.StringFlag{"key", "", "Path to private key PEM file.  If blank, will generate new keypair.", ""},
 			cli.BoolFlag{"stdout", "Print CA certificate to stdout in addition to saving file", ""},
+			cli.BoolFlag{"ecdsa", "Print CA certificate to stdout in addition to saving file", ""},
+			cli.StringFlag{"ecdsa-curve", "P256", "ECDSA curve to use to generate a key. Valid values are P224, P256 (recommended), P384, P521", ""},
 		},
 		Action: initAction,
 	}
@@ -101,9 +103,13 @@ func initAction(c *cli.Context) {
 		}
 		fmt.Printf("Read %s\n", c.String("key"))
 	} else {
-		key, err = pkix.CreateRSAKey(c.Int("key-bits"))
+		if c.Bool("ecdsa") {
+			key, err = pkix.CreateECDSAKey(c.String("ecdsa-curve"))
+		} else {
+			key, err = pkix.CreateRSAKey(c.Int("key-bits"))
+		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "Create RSA Key error:", err)
+			fmt.Fprintln(os.Stderr, "Create Private Key error:", err)
 			os.Exit(1)
 		}
 		if len(passphrase) > 0 {
